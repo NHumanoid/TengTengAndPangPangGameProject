@@ -1,10 +1,11 @@
-// Fill out your copyright notice in the Description page of Project Settings.
 
 #pragma once
 
+#include "WeaponDataAsset.h"
 #include "CoreMinimal.h"
 #include "GameFramework/Character.h"
 #include "PlayCharacter.generated.h"
+
 
 UCLASS()
 class PANGGAMEPROJECT_API APlayCharacter : public ACharacter
@@ -35,18 +36,38 @@ public:
 
 	UPROPERTY(EditDefaultsOnly, Category = "Input")
 	class UInputAction* MoveAction;
-	
+
 	UPROPERTY(EditDefaultsOnly, Category = "Input")
 	class UInputAction* JumpAction;
-	
+
 	UPROPERTY(EditDefaultsOnly, Category = "Input")
 	class UInputAction* LookAction;*/
 
 protected:
 
-	virtual void SetupPlayerInputComponent(class UInputComponent* PlayerInputComponent);
+    UPROPERTY(EditDefaultsOnly, Category = "Weapon")
+    TSubclassOf<class ABulletProjectile> BulletClass;
+
+    UPROPERTY(EditDefaultsOnly, Category = "Weapon")
+    FName MuzzleSocketName = TEXT("Muzzle");
+
+    UPROPERTY(EditDefaultsOnly, Category = "Weapon", meta = (ClampMin = "1.0", Units = "cm"))
+    float AimDistance = 10000.0f;
+
+	void TakeNormalGun();
+	void TakeShotGun();
+	void TakeMachineGun();
+	void TakeBoom();
+
+	void SetupPlayerInputComponent(class UInputComponent* PlayerInputComponent);
 
 	void InputActionMove(const struct FInputActionValue& Value);
 	void JumpActionMove(const struct FInputActionValue& Value);
 	void LookActionMove(const struct FInputActionValue& Value);
+
+	void InputActionSniper(const struct FInputActionValue& Value);
+	void InputActionGrenade(const struct FInputActionValue& Value);
+	void InputActionMachine(const struct FInputActionValue& Value);
+	void InputActionBoom(const struct FInputActionValue& Value);
+	void InputActionFire(const struct FInputActionValue& Value);
 };

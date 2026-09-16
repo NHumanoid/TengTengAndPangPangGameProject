@@ -1,28 +1,24 @@
-// Fill out your copyright notice in the Description page of Project Settings.
-
 #include "EnemyBall.h"
+#include "BulletProjectile.h"
 #include "Components/SphereComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Engine/World.h"
+#include "EngineUtils.h"
 #include "GameFramework/ProjectileMovementComponent.h"
 
-// Sets default values
 AEnemyBall::AEnemyBall()
 {
- 	// Set this actor to call Tick() every frame.  You can turn this off to improve performance if you don't need it.
     PrimaryActorTick.bCanEverTick = false;
 
-    // 1. 충돌체 생성 (루트)
     CollisionComp = CreateDefaultSubobject<USphereComponent>(TEXT("SphereComp"));
     CollisionComp->InitSphereRadius(32.0f);
     CollisionComp->SetCollisionProfileName(TEXT("BlockAllDynamic"));
     RootComponent = CollisionComp;
 
-    // 2. 비주얼 메시 (외형은 블루프린트에서 세팅)
     MeshComp = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("MeshComp"));
     MeshComp->SetupAttachment(CollisionComp);
-    MeshComp->SetCollisionEnabled(ECollisionEnabled::NoCollision); // 루트와 이중 충돌 방지
+    MeshComp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 
-    // 3. 이동 컴포넌트 기본 세팅
     ProjectileMovement = CreateDefaultSubobject<UProjectileMovementComponent>(TEXT("ProjectileMovement"));
     ProjectileMovement->UpdatedComponent = CollisionComp;
     ProjectileMovement->bShouldBounce = true;
@@ -31,78 +27,190 @@ AEnemyBall::AEnemyBall()
     ProjectileMovement->BounceVelocityStopSimulatingThreshold = 0.0f;
 }
 
-// Called when the game starts or when spawned
+float AEnemyBall::GetStageBounceHeight() const
+{
+    const float InitialHeight = FMath::Max(1.0f, InitialBounceHeight);
+    const float MinHeight = FMath::Clamp(MinimumBounceHeight, 1.0f, InitialHeight);
+    return FMath::Max(MinHeight, InitialHeight * FMath::Pow(
+        FMath::Clamp(BounceHeightMultiplier, 0.1f, 1.0f), FMath::Max(0, SplitGeneration)));
+}
+
+float AEnemyBall::CalculateBounceSpeed() const
+{
+    // v = sqrt(2gh). Recalculate from the stage, never from the last impact speed.
+    return FMath::Sqrt(2.0f * FMath::Abs(ProjectileMovement->GetGravityZ()) * GetStageBounceHeight());
+}
+
+void AEnemyBall::IgnoreOtherBalls()
+{
+    for (TActorIterator<AEnemyBall> It(GetWorld()); It; ++It)
+    {
+        AEnemyBall* OtherBall = *It;
+        if (OtherBall != this && IsValid(OtherBall))
+        {
+            CollisionComp->IgnoreActorWhenMoving(OtherBall, true);
+            OtherBall->CollisionComp->IgnoreActorWhenMoving(this, true);
+        }
+    }
+}
+
 void AEnemyBall::BeginPlay()
 {
-	Super::BeginPlay();
+    Super::BeginPlay();
 
+    CollisionComp->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block);
+    CollisionComp->SetCollisionResponseToChannel(ECC_WorldDynamic, ECR_Block);
     ProjectileMovement->OnProjectileBounce.AddDynamic(this, &AEnemyBall::OnBounce);
+    ProjectileMovement->bForceSubStepping = true;
+    IgnoreOtherBalls();
 
-    // 액터가 바라보는 정면 방향으로 시작
-    FVector ForwardDir = GetActorForwardVector();
-    ForwardDir.Z = 0.0f;
-    ForwardDir.Normalize();
+    BounceSpeed = CalculateBounceSpeed();
+    FVector ForwardDir = GetActorForwardVector().GetSafeNormal2D();
+    if (ForwardDir.IsNearlyZero())
+    {
+        ForwardDir = FVector::ForwardVector;
+    }
+    ProjectileMovement->Velocity = ForwardDir * MoveSpeed + FVector::UpVector * BounceSpeed;
+}
 
-    // 공이 바라보는 전방 방향(Forward) 속도 + 위쪽(Z) 속도 일괄 적용
-    ProjectileMovement->Velocity = (ForwardDir * MoveSpeed) + FVector(0.0f, 0.0f, BounceSpeed);
+void AEnemyBall::ReceiveProjectileHit()
+{
+    if (bProcessingHit || IsActorBeingDestroyed())
+    {
+        return;
+    }
+    bProcessingHit = true;
+
+    if (SplitGeneration >= FMath::Clamp(MaxSplitGeneration, 0, 4))
+    {
+        SetActorEnableCollision(false);
+        Destroy();
+        return;
+    }
+
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        bProcessingHit = false;
+        return;
+    }
+
+    const float ScaleFactor = FMath::Clamp(SplitScaleMultiplier, 0.1f, 0.9f);
+    const FVector ChildScale = GetActorScale3D() * ScaleFactor;
+    const float ChildRadius = CollisionComp->GetScaledSphereRadius() * ScaleFactor;
+    const FVector SplitLocation = GetActorLocation();
+    FVector BaseDirection = ProjectileMovement->Velocity.GetSafeNormal2D();
+    if (BaseDirection.IsNearlyZero())
+    {
+        BaseDirection = FVector::ForwardVector;
+    }
+
+    FCollisionQueryParams QueryParams;
+    QueryParams.AddIgnoredActor(this);
+    for (TActorIterator<AEnemyBall> It(World); It; ++It)
+    {
+        QueryParams.AddIgnoredActor(*It);
+    }
+
+    FCollisionObjectQueryParams ObjectParams;
+    ObjectParams.AddObjectTypesToQuery(ECC_WorldStatic);
+    ObjectParams.AddObjectTypesToQuery(ECC_WorldDynamic);
+    ObjectParams.AddObjectTypesToQuery(ECC_Pawn);
+
+    SetActorEnableCollision(false);
+    TArray<AEnemyBall*> SpawnedBalls;
+    for (int32 Index = 0; Index < 4; ++Index)
+    {
+        const FVector Direction = BaseDirection.RotateAngleAxis(45.0f + Index * 90.0f, FVector::UpVector);
+        FVector ChildLocation = SplitLocation + Direction * (ChildRadius * 1.5f + 2.0f);
+        FHitResult PlacementHit;
+        if (World->SweepSingleByObjectType(PlacementHit, SplitLocation, ChildLocation,
+            FQuat::Identity, ObjectParams, FCollisionShape::MakeSphere(ChildRadius), QueryParams))
+        {
+            // The parent's center already has room for a smaller sphere.
+            // Start there near walls instead of spawning beyond the wall.
+            ChildLocation = SplitLocation;
+        }
+
+        const FTransform SpawnTransform(Direction.Rotation(), ChildLocation, ChildScale);
+        AEnemyBall* Child = World->SpawnActorDeferred<AEnemyBall>(GetClass(), SpawnTransform,
+            GetOwner(), GetInstigator(), ESpawnActorCollisionHandlingMethod::AlwaysSpawn,
+            ESpawnActorScaleMethod::OverrideRootScale);
+        if (!Child)
+        {
+            break;
+        }
+
+        // Set these before BeginPlay initializes movement. Keep placed-instance tuning.
+        Child->SplitGeneration = SplitGeneration + 1;
+        Child->MaxSplitGeneration = MaxSplitGeneration;
+        Child->SplitScaleMultiplier = SplitScaleMultiplier;
+        Child->InitialBounceHeight = InitialBounceHeight;
+        Child->MinimumBounceHeight = MinimumBounceHeight;
+        Child->BounceHeightMultiplier = BounceHeightMultiplier;
+        Child->MoveSpeed = MoveSpeed;
+        Child->bStrictReverseOnWall = bStrictReverseOnWall;
+        Child->ProjectileMovement->ProjectileGravityScale = ProjectileMovement->ProjectileGravityScale;
+        Child->CollisionComp->SetSphereRadius(CollisionComp->GetUnscaledSphereRadius());
+        Child->FinishSpawning(SpawnTransform);
+        SpawnedBalls.Add(Child);
+        QueryParams.AddIgnoredActor(Child);
+    }
+
+    if (SpawnedBalls.Num() != 4)
+    {
+        // Keep the original ball if spawning the full group fails.
+        for (AEnemyBall* Child : SpawnedBalls)
+        {
+            Child->Destroy();
+        }
+        SetActorEnableCollision(true);
+        bProcessingHit = false;
+        UE_LOG(LogTemp, Warning, TEXT("Could not spawn all four child balls for %s"), *GetName());
+        return;
+    }
+
+    Destroy();
 }
 
 void AEnemyBall::OnBounce(const FHitResult& ImpactResult, const FVector& ImpactVelocity)
 {
-    // 바닥에 닿았을 때만 속도를 다시 고정값으로 리셋
-    FVector NewVelocity = ProjectileMovement->Velocity;
+    if (ABulletProjectile* Bullet = Cast<ABulletProjectile>(ImpactResult.GetActor()))
+    {
+        Bullet->ProcessImpact(this);
+        return;
+    }
+    if (bProcessingHit)
+    {
+        return;
+    }
 
-    // ----------------------------------------------------
-    // [1] 바닥에 충돌한 경우 (Normal.Z가 위를 향함)
-    // ----------------------------------------------------
+    FVector NewVelocity = ProjectileMovement->Velocity;
     if (ImpactResult.Normal.Z > 0.5f)
     {
-        // 점프 높이 유지
+        BounceSpeed = CalculateBounceSpeed();
         NewVelocity.Z = BounceSpeed;
-
-        // 수평 속도가 마찰로 줄지 않도록 MoveSpeed로 고정 유지
-        FVector HorizDir = FVector(NewVelocity.X, NewVelocity.Y, 0.0f).GetSafeNormal();
+        FVector HorizDir = NewVelocity.GetSafeNormal2D();
         if (HorizDir.IsNearlyZero())
         {
-            HorizDir = GetActorForwardVector();
+            HorizDir = GetActorForwardVector().GetSafeNormal2D();
         }
-
         NewVelocity.X = HorizDir.X * MoveSpeed;
         NewVelocity.Y = HorizDir.Y * MoveSpeed;
     }
-    // ----------------------------------------------------
-    // [2] 벽이나 장애물(옆면)에 충돌한 경우
-    // ----------------------------------------------------
-    else
+    else if (ImpactResult.Normal.Z > -0.5f)
     {
-        FVector NextDirection = FVector::ZeroVector;
-
-        if (bStrictReverseOnWall)
-        {
-            // [모드 A] 충돌 직전 이동 방향의 정확한 180도 반대 방향
-            FVector PrevDir = FVector(ImpactVelocity.X, ImpactVelocity.Y, 0.0f).GetSafeNormal();
-            NextDirection = -PrevDir;
-        }
-        else
-        {
-            // [모드 B] 벽면 Normal을 이용한 입사각/반사각 계산 (당구공 방식)
-            FVector IncomingDir = FVector(ImpactVelocity.X, ImpactVelocity.Y, 0.0f).GetSafeNormal();
-            FVector WallNormal = FVector(ImpactResult.Normal.X, ImpactResult.Normal.Y, 0.0f).GetSafeNormal();
-            NextDirection = FMath::GetReflectionVector(IncomingDir, WallNormal).GetSafeNormal();
-        }
-
-        // 반사된 수평 방향에 MoveSpeed 적용
+        const FVector IncomingDir = ImpactVelocity.GetSafeNormal2D();
+        const FVector WallNormal = ImpactResult.Normal.GetSafeNormal2D();
+        const FVector NextDirection = bStrictReverseOnWall ? -IncomingDir :
+            FMath::GetReflectionVector(IncomingDir, WallNormal).GetSafeNormal2D();
         NewVelocity.X = NextDirection.X * MoveSpeed;
         NewVelocity.Y = NextDirection.Y * MoveSpeed;
-
-        // 공 액터의 회전도 새로 나아가는 방향을 바라보도록 갱신
         if (!NextDirection.IsNearlyZero())
         {
             SetActorRotation(NextDirection.Rotation());
         }
     }
-
-    // 최종 속도 적용
+    // Ceiling impacts keep the movement component's downward reflection.
     ProjectileMovement->Velocity = NewVelocity;
 }
-
